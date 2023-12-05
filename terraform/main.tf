@@ -4,23 +4,23 @@ provider "google" {
   region      = "us-central1"
 }
 
-
-provider "kubernetes" {
-  load_config_file       = false
-  host                   = google_container_cluster.k8s_cluster.endpoint
-  cluster_ca_certificate = base64decode(google_container_cluster.k8s_cluster.master_auth[0].cluster_ca_certificate)
-  token                  = google_container_cluster.k8s_cluster.master_auth[0].token
+locals {
+  kubeconfig_content = google_container_cluster.ghost[0].master_auth[0].cluster_ca_certificate != null ? templatefile("${path.module}/kubeconfig_template.tpl", {
+    cluster_ca_certificate = google_container_cluster.ghost[0].master_auth[0].cluster_ca_certificate
+    endpoint               = google_container_cluster.ghost[0].endpoint
+    name                   = google_container_cluster.ghost[0].name
+  }) : ""
 }
 
-
-resource "google_container_cluster" "k8s_cluster" {
-  count    = var.create_cluster ? 1 : 0
-  name     = "ghost"
-  location = "us-central1"
-
-  node_pool {
-    name   = "default-pool"
-    initial_node_count = 1
+resource "google_container_cluster" "ghost" {
+  count                = 1
+  name                 = "ghost"
+  location             = "us-central1"
+  deletion_protection = false
+  initial_node_count   = 1
+  enable_autopilot     = true
+  lifecycle {
+    ignore_changes = [name]
   }
 }
 
@@ -31,17 +31,46 @@ resource "google_compute_disk" "ghost_pv" {
   zone  = "us-central1-a"
 }
 
-resource "null_resource" "clone_repo" {
-  provisioner "local-exec" {
-    command = "git clone https://github.com/mahdiswaidan/Ghost ."
-  }
+provider "kubernetes" {
+  kubectl_version = "1.27.0"
+  load_config_file = false
+  host             = google_container_cluster.ghost[0].endpoint
+  token            = google_container_cluster.ghost[0].master_auth[0].token
+  cluster_ca_certificate = base64decode(
+    google_container_cluster.ghost[0].master_auth[0].cluster_ca_certificate
+  )
 }
 
-resource "null_resource" "apply_manifests" {
-  provisioner "local-exec" {
-    command = "kubectl apply -f ${path.module}/./*.yaml"
-  }
+data "google_client_config" "default" {}
 
-  depends_on = [null_resource.clone_repo, google_compute_disk.ghost_pv]
+# Get the list of YAML files in the manifests directory
+data "kubectl_filename_list" "manifests" {
+  pattern = "${path.module}/../yaml/*.yaml"
 }
 
+# Apply each YAML file to the cluster
+resource "kubectl_manifest" "test" {
+ 
+  count     = length(data.kubectl_filename_list.manifests.matches)
+  yaml_body = file(element(data.kubectl_filename_list.manifests.matches, count.index))
+}
+
+output "kubeconfig" {
+  value = local.kubeconfig_content
+}
+
+terraform {
+  required_providers {
+    kubectl = {
+      source  = "gavinbunney/kubectl"
+      version = ">= 1.0.0"
+    }
+  }
+}
+output "yaml_content" {
+  value = data.kubectl_filename_list.manifests.matches
+}
+
+output "manifest_count" {
+  value = length(data.kubectl_filename_list.manifests.matches)
+}
